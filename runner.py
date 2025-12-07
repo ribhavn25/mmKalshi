@@ -1,27 +1,46 @@
 import argparse
 import logging
 from concurrent.futures import ThreadPoolExecutor
-import yaml
-from dotenv import load_dotenv
 import os
 from typing import Dict
 
-from mm import KalshiTradingAPI, AvellanedaMarketMaker
+import yaml
+from dotenv import load_dotenv
+
+from mm import AvellanedaMarketMaker, KalshiTradingAPI
+
 
 def load_config(config_file):
     with open(config_file, 'r') as f:
         return yaml.safe_load(f)
 
+
 def create_api(api_config, logger):
+    api_key_id = os.getenv("KALSHI_API_KEY_ID")
+    private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+    base_url = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
+
+    missing = [name for name, value in {
+        "KALSHI_API_KEY_ID": api_key_id,
+        "KALSHI_PRIVATE_KEY_PATH": private_key_path,
+        "KALSHI_BASE_URL": base_url,
+    }.items() if not value]
+
+    if missing:
+        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+
     return KalshiTradingAPI(
-        email=os.getenv("KALSHI_EMAIL"),
-        password=os.getenv("KALSHI_PASSWORD"),
+        api_key_id=api_key_id,
+        private_key_path=private_key_path,
         market_ticker=api_config['market_ticker'],
-        base_url=os.getenv("KALSHI_BASE_URL"),
+        base_url=base_url,
         logger=logger,
     )
 
-def create_market_maker(mm_config, api, logger):
+
+def create_market_maker(mm_config, api, logger, trade_side: str):
+    if trade_side not in ("yes", "no"):
+        raise ValueError(f"trade_side must be 'yes' or 'no', got {trade_side}")
     return AvellanedaMarketMaker(
         logger=logger,
         api=api,
@@ -34,7 +53,8 @@ def create_market_maker(mm_config, api, logger):
         min_spread=mm_config.get('min_spread', 0.01),
         position_limit_buffer=mm_config.get('position_limit_buffer', 0.1),
         inventory_skew_factor=mm_config.get('inventory_skew_factor', 0.01),
-        trade_side=mm_config.get('trade_side', 'yes')
+        trade_side=trade_side,
+        max_order_size=mm_config.get('max_order_size')
     )
 
 def run_strategy(config_name: str, config: Dict):
@@ -61,22 +81,32 @@ def run_strategy(config_name: str, config: Dict):
 
     logger.info(f"Starting strategy: {config_name}")
 
-    # Create API
-    api = create_api(config['api'], logger)
-
-    # Create market maker
-    market_maker = create_market_maker(config['market_maker'], api, logger)
-
+    api = None
     try:
+        # Create API
+        api = create_api(config['api'], logger)
+
+        # Create market maker
+        market_maker = create_market_maker(
+            config['market_maker'],
+            api,
+            logger,
+            trade_side=config['api'].get('trade_side', 'yes')
+        )
+
         # Run market maker
         market_maker.run(config.get('dt', 1.0))
     except KeyboardInterrupt:
         logger.info("Market maker stopped by user")
     except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
+        logger.exception(f"An error occurred in strategy {config_name}: {str(e)}")
     finally:
         # Ensure logout happens even if an exception occurs
-        api.logout()
+        if api:
+            try:
+                api.logout()
+            except Exception:
+                logger.exception("Failed to logout cleanly")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kalshi Market Making Algorithm")

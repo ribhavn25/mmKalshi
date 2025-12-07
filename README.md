@@ -9,11 +9,11 @@ This project implements a market making algorithm for Kalshi markets, capable of
    ```
    pip install -r requirements.txt
    ```
-3. Create a `.env` file with your Kalshi credentials:
+3. Create a `.env` file with your Kalshi API credentials:
    ```
-   KALSHI_EMAIL=your_email
-   KALSHI_PASSWORD=your_password
-   KALSHI_BASE_URL=https://trading-api.kalshi.com/trade-api/v2
+   KALSHI_API_KEY_ID=your_key_id
+   KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your/private_key.pem
+   KALSHI_BASE_URL=https://api.elections.kalshi.com/trade-api/v2
    ```
 4. Create or modify the `config.yaml` file with your market making configurations. Each configuration in this file will run as a separate strategy.
 5. Run the script:
@@ -65,9 +65,9 @@ You can define multiple strategies in the same file. The runner will execute all
    Follow the prompts, but don't deploy yet.
 4. Set your Kalshi credentials and base URL as secrets:
    ```
-   flyctl secrets set KALSHI_EMAIL=your_email
-   flyctl secrets set KALSHI_PASSWORD=your_password
-   flyctl secrets set KALSHI_BASE_URL=https://trading-api.kalshi.com/trade-api/v2
+   flyctl secrets set KALSHI_API_KEY_ID=your_key_id
+   flyctl secrets set KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/your/private_key.pem
+   flyctl secrets set KALSHI_BASE_URL=https://api.elections.kalshi.com/trade-api/v2
    ```
 5. Ensure your `config.yaml` file is in the project directory and contains all the strategies you want to run.
 6. Deploy the app:

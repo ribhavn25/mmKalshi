@@ -1,10 +1,14 @@
 import abc
 import time
 from typing import Dict, List, Tuple
-import requests
 import logging
 import uuid
 import math
+from pathlib import Path
+
+import kalshi_python
+from kalshi_python import KalshiClient, Configuration
+from kalshi_python import exceptions as kalshi_exceptions
 
 class AbstractTradingAPI(abc.ABC):
     @abc.abstractmethod
@@ -30,95 +34,66 @@ class AbstractTradingAPI(abc.ABC):
 class KalshiTradingAPI(AbstractTradingAPI):
     def __init__(
         self,
-        email: str,
-        password: str,
+        api_key_id: str,
+        private_key_path: str,
         market_ticker: str,
         base_url: str,
         logger: logging.Logger,
     ):
-        self.email = email
-        self.password = password
+        self.api_key_id = api_key_id
+        self.private_key_path = private_key_path
         self.market_ticker = market_ticker
-        self.token = None
-        self.member_id = None
         self.logger = logger
-        self.base_url = base_url
-        self.login()
+        self.base_url = base_url or "https://api.elections.kalshi.com/trade-api/v2"
+        self.client = self._create_client()
 
-    def login(self):
-        url = f"{self.base_url}/login"
-        data = {"email": self.email, "password": self.password}
-        response = requests.post(url, json=data)
-        response.raise_for_status()
-        result = response.json()
-        self.token = result["token"]
-        self.member_id = result.get("member_id")
-        self.logger.info("Successfully logged in")
+    def _create_client(self) -> KalshiClient:
+        key_path = Path(self.private_key_path).expanduser()
+        if not key_path.exists():
+            raise FileNotFoundError(f"Private key not found at {key_path}")
+        private_key_pem = key_path.read_text()
+
+        configuration = Configuration(host=self.base_url)
+        # kalshi_python.KalshiClient looks for these attributes on the configuration
+        configuration.api_key_id = self.api_key_id
+        configuration.private_key_pem = private_key_pem
+
+        return kalshi_python.KalshiClient(configuration=configuration)
 
     def logout(self):
-        if self.token:
-            url = f"{self.base_url}/logout"
-            headers = self.get_headers()
-            response = requests.post(url, headers=headers)
-            response.raise_for_status()
-            self.token = None
-            self.member_id = None
-            self.logger.info("Successfully logged out")
-
-    def get_headers(self):
-        return {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        }
-
-    def make_request(
-        self, method: str, path: str, params: Dict = None, data: Dict = None
-    ):
-        url = f"{self.base_url}{path}"
-        headers = self.get_headers()
-
-        try:
-            response = requests.request(
-                method, url, headers=headers, params=params, json=data
-            )
-            self.logger.debug(f"Request URL: {response.url}")
-            self.logger.debug(f"Request headers: {response.request.headers}")
-            self.logger.debug(f"Request params: {params}")
-            self.logger.debug(f"Request data: {data}")
-            self.logger.debug(f"Response status code: {response.status_code}")
-            self.logger.debug(f"Response content: {response.text}")
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Request failed: {e}")
-            if hasattr(e, "response") and e.response is not None:
-                self.logger.error(f"Response content: {e.response.text}")
-            raise
+        # API key auth is stateless; nothing to tear down
+        self.logger.info("Logout skipped (API key authentication)")
 
     def get_position(self) -> int:
         self.logger.info("Retrieving position...")
-        path = "/portfolio/positions"
-        params = {"ticker": self.market_ticker, "settlement_status": "unsettled"}
-        response = self.make_request("GET", path, params=params)
-        positions = response.get("market_positions", [])
-
-        total_position = 0
-        for position in positions:
-            if position["ticker"] == self.market_ticker:
-                total_position += position["position"]
-
-        self.logger.info(f"Current position: {total_position}")
-        return total_position
+        response = self.client.get_positions(ticker=self.market_ticker)
+        positions = response.positions or []
+        net_position = 0
+        for p in positions:
+            self.logger.debug(f"Position detail: ticker={p.ticker}, position={p.position}, market_result={p.market_result}")
+            if p.ticker != self.market_ticker:
+                continue
+            pos_val = int(p.position or 0)
+            # If market_result is provided, treat 'no' as negative yes; otherwise just add the raw position
+            if p.market_result == 'no':
+                net_position -= pos_val
+            else:
+                net_position += pos_val
+        self.logger.info(f"Current position (yes side): {net_position}")
+        return net_position
 
     def get_price(self) -> Dict[str, float]:
         self.logger.info("Retrieving market data...")
-        path = f"/markets/{self.market_ticker}"
-        data = self.make_request("GET", path)
+        data = self.client.get_market(self.market_ticker)
 
-        yes_bid = float(data["market"]["yes_bid"]) / 100
-        yes_ask = float(data["market"]["yes_ask"]) / 100
-        no_bid = float(data["market"]["no_bid"]) / 100
-        no_ask = float(data["market"]["no_ask"]) / 100
+        market = data.market
+        if not market:
+            raise ValueError(f"No market data returned for {self.market_ticker}")
+
+        yes_bid = float(market.yes_bid or 0) / 100
+        yes_ask = float(market.yes_ask or 0) / 100
+        no_bid = float(market.no_bid or 0) / 100
+        no_ask = float(market.no_ask or 0) / 100
         
         yes_mid_price = round((yes_bid + yes_ask) / 2, 2)
         no_mid_price = round((no_bid + no_ask) / 2, 2)
@@ -127,9 +102,15 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.logger.info(f"Current no mid-market price: ${no_mid_price:.2f}")
         return {"yes": yes_mid_price, "no": no_mid_price}
 
+    def get_balance_cents(self) -> int:
+        self.logger.info("Retrieving balance...")
+        response = self.client.get_balance()
+        balance_cents = int(response.balance or 0)
+        self.logger.info(f"Current balance: ${balance_cents/100:.2f}")
+        return balance_cents
+
     def place_order(self, action: str, side: str, price: float, quantity: int, expiration_ts: int = None) -> str:
         self.logger.info(f"Placing {action} order for {side} side at price ${price:.2f} with quantity {quantity}...")
-        path = "/portfolio/orders"
         data = {
             "ticker": self.market_ticker,
             "action": action.lower(),  # 'buy' or 'sell'
@@ -149,31 +130,26 @@ class KalshiTradingAPI(AbstractTradingAPI):
             data["expiration_ts"] = expiration_ts
 
         try:
-            response = self.make_request("POST", path, data=data)
-            order_id = response["order"]["order_id"]
+            response = self.client.create_order(**data)
+            order = response.order
+            order_id = order.order_id if order else None
             self.logger.info(f"Placed {action} order for {side} side at price ${price:.2f} with quantity {quantity}, order ID: {order_id}")
             return str(order_id)
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             self.logger.error(f"Failed to place order: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                self.logger.error(f"Response content: {e.response.text}")
-                self.logger.error(f"Request data: {data}")
             raise
 
     def cancel_order(self, order_id: int) -> bool:
         self.logger.info(f"Canceling order with ID {order_id}...")
-        path = f"/portfolio/orders/{order_id}"
-        response = self.make_request("DELETE", path)
-        success = response["reduced_by"] > 0
+        response = self.client.cancel_order(order_id=str(order_id))
+        success = bool(response.reduced_by and response.reduced_by > 0)
         self.logger.info(f"Canceled order with ID {order_id}, success: {success}")
         return success
 
     def get_orders(self) -> List[Dict]:
         self.logger.info("Retrieving orders...")
-        path = "/portfolio/orders"
-        params = {"ticker": self.market_ticker, "status": "resting"}
-        response = self.make_request("GET", path, params=params)
-        orders = response.get("orders", [])
+        response = self.client.get_orders(ticker=self.market_ticker, status="resting")
+        orders = [order.to_dict() for order in (response.orders or [])]
         self.logger.info(f"Retrieved {len(orders)} orders")
         return orders
 
@@ -191,7 +167,8 @@ class AvellanedaMarketMaker:
         min_spread: float = 0.01,
         position_limit_buffer: float = 0.1,
         inventory_skew_factor: float = 0.01,
-        trade_side: str = "yes"
+        trade_side: str = "yes",
+        max_order_size: int = None,
     ):
         self.api = api
         self.logger = logger
@@ -205,6 +182,7 @@ class AvellanedaMarketMaker:
         self.position_limit_buffer = position_limit_buffer
         self.inventory_skew_factor = inventory_skew_factor
         self.trade_side = trade_side
+        self.max_order_size = max_order_size
 
     def run(self, dt: float):
         start_time = time.time()
@@ -224,7 +202,7 @@ class AvellanedaMarketMaker:
             self.logger.info(f"Reservation price: {reservation_price:.4f}")
             self.logger.info(f"Computed desired bid: {bid_price:.4f}, ask: {ask_price:.4f}")
 
-            self.manage_orders(bid_price, ask_price, buy_size, sell_size)
+            self.manage_orders(bid_price, ask_price, buy_size, sell_size, inventory)
 
             time.sleep(dt)
 
@@ -267,24 +245,33 @@ class AvellanedaMarketMaker:
         return self.base_gamma * math.exp(-abs(position_ratio))
 
     def calculate_order_sizes(self, inventory: int) -> Tuple[int, int]:
-        remaining_capacity = self.max_position - abs(inventory)
+        remaining_capacity = max(self.max_position - max(inventory, 0), 0)
         buffer_size = int(self.max_position * self.position_limit_buffer)
-        
+
+        # Buys are limited by remaining capacity and max_order_size
+        buy_size = max(0, min(self.max_position, remaining_capacity))
+        if self.max_order_size:
+            buy_size = min(buy_size, self.max_order_size)
+        if buy_size == 0 and remaining_capacity > 0:
+            buy_size = 1  # place a minimal buy if we have any capacity
+
+        # Sells are limited by owned inventory and max_order_size
         if inventory > 0:
-            buy_size = max(1, min(buffer_size, remaining_capacity))
-            sell_size = max(1, self.max_position)
+            sell_size = max(0, min(inventory, buffer_size if buffer_size > 0 else inventory))
+            if self.max_order_size:
+                sell_size = min(sell_size, self.max_order_size)
         else:
-            buy_size = max(1, self.max_position)
-            sell_size = max(1, min(buffer_size, remaining_capacity))
+            sell_size = 0
         
         return buy_size, sell_size
 
-    def manage_orders(self, bid_price: float, ask_price: float, buy_size: int, sell_size: int):
+    def manage_orders(self, bid_price: float, ask_price: float, buy_size: int, sell_size: int, inventory: int):
         current_orders = self.api.get_orders()
         self.logger.info(f"Retrieved {len(current_orders)} total orders")
 
         buy_orders = []
         sell_orders = []
+        opposite_orders = []
 
         for order in current_orders:
             if order['side'] == self.trade_side:
@@ -292,17 +279,36 @@ class AvellanedaMarketMaker:
                     buy_orders.append(order)
                 elif order['action'] == 'sell':
                     sell_orders.append(order)
+            else:
+                opposite_orders.append(order)
+
+        # Cancel any orders on the opposite side to ensure we only trade one side
+        for order in opposite_orders:
+            try:
+                self.logger.info(f"Cancelling opposite-side order {order['order_id']} side {order['side']}")
+                self.api.cancel_order(order['order_id'])
+            except kalshi_exceptions.NotFoundException:
+                self.logger.info(f"Opposite-side order {order['order_id']} already gone when canceling")
+            except Exception as e:
+                self.logger.error(f"Failed to cancel opposite-side order {order['order_id']}: {e}")
 
         self.logger.info(f"Current buy orders: {len(buy_orders)}")
         self.logger.info(f"Current sell orders: {len(sell_orders)}")
+        self.logger.info(f"Desired buy size: {buy_size}, Desired sell size: {sell_size}, Side inventory: {inventory}")
 
         # Handle buy orders
-        self.handle_order_side('buy', buy_orders, bid_price, buy_size)
+        if buy_size >= 1:
+            self.handle_order_side('buy', buy_orders, bid_price, buy_size, inventory)
+        else:
+            self.logger.info("Skipping buy management; desired buy size < 1")
 
         # Handle sell orders
-        self.handle_order_side('sell', sell_orders, ask_price, sell_size)
+        if sell_size >= 1:
+            self.handle_order_side('sell', sell_orders, ask_price, sell_size, inventory)
+        else:
+            self.logger.info("Skipping sell management; desired sell size < 1")
 
-    def handle_order_side(self, action: str, orders: List[Dict], desired_price: float, desired_size: int):
+    def handle_order_side(self, action: str, orders: List[Dict], desired_price: float, desired_size: int, inventory: int):
         keep_order = None
         for order in orders:
             current_price = float(order['yes_price']) / 100 if self.trade_side == 'yes' else float(order['no_price']) / 100
@@ -311,11 +317,29 @@ class AvellanedaMarketMaker:
                 self.logger.info(f"Keeping existing {action} order. ID: {order['order_id']}, Price: {current_price:.4f}")
             else:
                 self.logger.info(f"Cancelling extraneous {action} order. ID: {order['order_id']}, Price: {current_price:.4f}")
-                self.api.cancel_order(order['order_id'])
+                try:
+                    self.api.cancel_order(order['order_id'])
+                except kalshi_exceptions.NotFoundException:
+                    # Order already gone; not fatal.
+                    self.logger.info(f"{action.capitalize()} order {order['order_id']} already gone when canceling")
+                except Exception as e:
+                    self.logger.error(f"Failed to cancel {action} order {order['order_id']}: {e}")
+                    return
 
         current_price = self.api.get_price()[self.trade_side]
         if keep_order is None:
             if (action == 'buy' and desired_price < current_price) or (action == 'sell' and desired_price > current_price):
+                if action == 'buy':
+                    available_cents = self.api.get_balance_cents()
+                    required_cents = int(desired_price * 100 * desired_size)
+                    if required_cents > available_cents:
+                        self.logger.info(f"Skipping buy order; needed ${required_cents/100:.2f} > available ${available_cents/100:.2f}")
+                        return
+                else:
+                    available_inventory = max(inventory, 0)
+                    if desired_size > available_inventory:
+                        self.logger.info(f"Skipping sell order; desired size {desired_size} > available inventory {available_inventory}")
+                        return
                 try:
                     order_id = self.api.place_order(action, self.trade_side, desired_price, desired_size, int(time.time()) + self.order_expiration)
                     self.logger.info(f"Placed new {action} order. ID: {order_id}, Price: {desired_price:.4f}, Size: {desired_size}")
